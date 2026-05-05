@@ -1,4 +1,6 @@
 require('dotenv').config();
+const fs = require('fs');
+
 const {
   Client,
   GatewayIntentBits,
@@ -14,28 +16,42 @@ const client = new Client({
   ]
 });
 
-// 🔐 CONFIG
-const CONFIG = {
-  WHITELIST: ["1365339016446345240"],
+// 📂 DATABASE (JSON)
+const DB_FILE = "./data.json";
+let db = {};
 
-  LIMITS: {
-    CHANNEL_DELETE: 3,
-    ROLE_DELETE: 3,
-    ROLE_CREATE: 4,
-    BAN: 3,
-    KICK: 3,
-    WEBHOOK: 3
-  },
+if (fs.existsSync(DB_FILE)) {
+  db = JSON.parse(fs.readFileSync(DB_FILE));
+}
 
-  WINDOW: 5000,
-  LOG_CHANNEL: "security-logs",
-  LOCKDOWN: true,
-  RESTORE: true
-};
+function saveDB() {
+  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+}
 
+// ⚙️ DEFAULT CONFIG
+function getConfig(guildId) {
+  if (!db[guildId]) {
+    db[guildId] = {
+      whitelist: [],
+      logChannel: null,
+      limits: {
+        CHANNEL_DELETE: 3,
+        ROLE_DELETE: 3,
+        ROLE_CREATE: 4,
+        BAN: 3,
+        KICK: 3,
+        WEBHOOK: 3
+      }
+    };
+    saveDB();
+  }
+  return db[guildId];
+}
+
+// 🧠 TRACK
 const tracker = new Map();
+const WINDOW = 5000;
 
-// 🧠 TRACK ACTIONS
 function track(userId, action) {
   const now = Date.now();
 
@@ -45,31 +61,48 @@ function track(userId, action) {
   if (!data[action]) data[action] = [];
 
   data[action].push(now);
-  data[action] = data[action].filter(t => now - t < CONFIG.WINDOW);
+  data[action] = data[action].filter(t => now - t < WINDOW);
 
   return data[action].length;
 }
 
+// 🔐 SAFE CHECK
+function isSafe(userId, guild) {
+  const config = getConfig(guild.id);
+  return userId === guild.ownerId || config.whitelist.includes(userId);
+}
+
 // 📜 LOG
 async function log(guild, msg) {
-  const ch = guild.channels.cache.find(c => c.name === CONFIG.LOG_CHANNEL);
+  const config = getConfig(guild.id);
+  let ch = guild.channels.cache.get(config.logChannel);
+
+  if (!ch) {
+    ch = guild.channels.cache.find(c => c.name === "security-logs");
+    if (!ch) {
+      ch = await guild.channels.create({ name: "security-logs" }).catch(() => null);
+    }
+    if (ch) {
+      config.logChannel = ch.id;
+      saveDB();
+    }
+  }
+
   if (ch) ch.send(`📜 ${msg}`).catch(() => {});
   console.log(msg);
 }
 
-// 🔍 GET EXECUTOR
+// 🔍 EXECUTOR
 async function getExecutor(guild, type) {
   await new Promise(r => setTimeout(r, 1200));
   const logs = await guild.fetchAuditLogs({ type, limit: 1 }).catch(() => null);
-  if (!logs) return null;
-  return logs.entries.first()?.executor || null;
+  return logs?.entries.first()?.executor || null;
 }
 
 // 🚨 PUNISH
 async function punish(guild, user, reason) {
   if (!user) return;
-  if (CONFIG.WHITELIST.includes(user.id)) return;
-  if (user.id === guild.ownerId) return;
+  if (isSafe(user.id, guild)) return;
   if (user.bot) return;
 
   const member = await guild.members.fetch(user.id).catch(() => null);
@@ -78,17 +111,13 @@ async function punish(guild, user, reason) {
   try {
     await member.roles.set([]);
     await member.ban({ reason });
-    await log(guild, `🚨 ${user.tag} punished → ${reason}`);
-  } catch (e) {
-    await log(guild, `❌ Failed to punish ${user.tag}`);
-  }
+    await log(guild, `🚨 ${user.tag} → ${reason}`);
+  } catch {}
 }
 
 // 🔒 LOCKDOWN
 async function lockdown(guild) {
-  if (!CONFIG.LOCKDOWN) return;
-
-  guild.channels.cache.forEach(async (ch) => {
+  guild.channels.cache.forEach(async ch => {
     try {
       await ch.permissionOverwrites.edit(guild.roles.everyone, {
         SendMessages: false
@@ -96,12 +125,12 @@ async function lockdown(guild) {
     } catch {}
   });
 
-  await log(guild, "🔒 Server locked down");
+  await log(guild, "🔒 Lockdown enabled");
 }
 
 // 🔓 UNLOCK
 async function unlock(guild) {
-  guild.channels.cache.forEach(async (ch) => {
+  guild.channels.cache.forEach(async ch => {
     try {
       await ch.permissionOverwrites.edit(guild.roles.everyone, {
         SendMessages: true
@@ -109,27 +138,24 @@ async function unlock(guild) {
     } catch {}
   });
 
-  await log(guild, "🔓 Server unlocked");
+  await log(guild, "🔓 Lockdown removed");
 }
 
-// ♻️ RESTORE CHANNEL
+// ♻️ RESTORE
 async function restore(channel) {
-  if (!CONFIG.RESTORE) return;
-
   try {
     await channel.guild.channels.create({
       name: channel.name,
       type: channel.type,
       parent: channel.parentId || null
     });
-
     await log(channel.guild, `♻️ Restored ${channel.name}`);
   } catch {}
 }
 
 // 🟢 READY
 client.once('ready', () => {
-  console.log(`🔥 Bot online as ${client.user.tag}`);
+  console.log(`🔥 PRO bot ready: ${client.user.tag}`);
 });
 
 // 🚨 EVENTS
@@ -138,9 +164,10 @@ client.on('channelDelete', async (channel) => {
   const user = await getExecutor(channel.guild, AuditLogEvent.ChannelDelete);
   if (!user) return;
 
+  const config = getConfig(channel.guild.id);
   const count = track(user.id, "CHANNEL_DELETE");
 
-  if (count >= CONFIG.LIMITS.CHANNEL_DELETE) {
+  if (count >= config.limits.CHANNEL_DELETE) {
     await punish(channel.guild, user, "Channel nuke");
     await lockdown(channel.guild);
   }
@@ -152,9 +179,10 @@ client.on('roleDelete', async (role) => {
   const user = await getExecutor(role.guild, AuditLogEvent.RoleDelete);
   if (!user) return;
 
+  const config = getConfig(role.guild.id);
   const count = track(user.id, "ROLE_DELETE");
 
-  if (count >= CONFIG.LIMITS.ROLE_DELETE) {
+  if (count >= config.limits.ROLE_DELETE) {
     await punish(role.guild, user, "Role delete nuke");
   }
 });
@@ -163,9 +191,10 @@ client.on('roleCreate', async (role) => {
   const user = await getExecutor(role.guild, AuditLogEvent.RoleCreate);
   if (!user) return;
 
+  const config = getConfig(role.guild.id);
   const count = track(user.id, "ROLE_CREATE");
 
-  if (count >= CONFIG.LIMITS.ROLE_CREATE) {
+  if (count >= config.limits.ROLE_CREATE) {
     await punish(role.guild, user, "Role spam");
   }
 });
@@ -174,9 +203,10 @@ client.on('guildBanAdd', async (ban) => {
   const user = await getExecutor(ban.guild, AuditLogEvent.MemberBanAdd);
   if (!user) return;
 
+  const config = getConfig(ban.guild.id);
   const count = track(user.id, "BAN");
 
-  if (count >= CONFIG.LIMITS.BAN) {
+  if (count >= config.limits.BAN) {
     await punish(ban.guild, user, "Mass ban");
   }
 });
@@ -185,9 +215,10 @@ client.on('guildMemberRemove', async (member) => {
   const user = await getExecutor(member.guild, AuditLogEvent.MemberKick);
   if (!user) return;
 
+  const config = getConfig(member.guild.id);
   const count = track(user.id, "KICK");
 
-  if (count >= CONFIG.LIMITS.KICK) {
+  if (count >= config.limits.KICK) {
     await punish(member.guild, user, "Mass kick");
   }
 });
@@ -196,9 +227,10 @@ client.on('webhookUpdate', async (channel) => {
   const user = await getExecutor(channel.guild, AuditLogEvent.WebhookCreate);
   if (!user) return;
 
+  const config = getConfig(channel.guild.id);
   const count = track(user.id, "WEBHOOK");
 
-  if (count >= CONFIG.LIMITS.WEBHOOK) {
+  if (count >= config.limits.WEBHOOK) {
     await punish(channel.guild, user, "Webhook abuse");
   }
 });
@@ -207,7 +239,25 @@ client.on('webhookUpdate', async (channel) => {
 
 client.on('messageCreate', async (msg) => {
   if (!msg.guild) return;
-  if (!CONFIG.WHITELIST.includes(msg.author.id)) return;
+  if (!msg.member.permissions.has("Administrator")) return;
+
+  const config = getConfig(msg.guild.id);
+
+  if (msg.content === "!setup") {
+    config.logChannel = msg.channel.id;
+    saveDB();
+    msg.reply("✅ Log channel set");
+  }
+
+  if (msg.content.startsWith("!whitelist add")) {
+    const id = msg.mentions.users.first()?.id;
+    if (!id) return msg.reply("Mention user");
+
+    config.whitelist.push(id);
+    saveDB();
+
+    msg.reply("✅ Added to whitelist");
+  }
 
   if (msg.content === "!lockdown") {
     await lockdown(msg.guild);
@@ -220,7 +270,7 @@ client.on('messageCreate', async (msg) => {
   }
 
   if (msg.content === "!status") {
-    msg.reply("🛡️ Anti-nuke system active");
+    msg.reply("🛡️ Anti-nuke PRO active");
   }
 });
 
