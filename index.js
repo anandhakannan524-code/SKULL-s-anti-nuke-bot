@@ -16,7 +16,7 @@ const client = new Client({
   ]
 });
 
-// 📂 DATABASE (JSON)
+// 📂 DATABASE
 const DB_FILE = "./data.json";
 let db = {};
 
@@ -28,7 +28,7 @@ function saveDB() {
   fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 }
 
-// ⚙️ DEFAULT CONFIG
+// ⚙️ CONFIG
 function getConfig(guildId) {
   if (!db[guildId]) {
     db[guildId] = {
@@ -79,9 +79,11 @@ async function log(guild, msg) {
 
   if (!ch) {
     ch = guild.channels.cache.find(c => c.name === "security-logs");
+
     if (!ch) {
       ch = await guild.channels.create({ name: "security-logs" }).catch(() => null);
     }
+
     if (ch) {
       config.logChannel = ch.id;
       saveDB();
@@ -243,15 +245,27 @@ client.on('messageCreate', async (msg) => {
 
   const config = getConfig(msg.guild.id);
 
+  // ✅ FIXED SETUP (auto create channel)
   if (msg.content === "!setup") {
-    config.logChannel = msg.channel.id;
+    let ch = msg.guild.channels.cache.find(c => c.name === "security-logs");
+
+    if (!ch) {
+      ch = await msg.guild.channels.create({
+        name: "security-logs"
+      }).catch(() => null);
+    }
+
+    if (!ch) return msg.reply("❌ Failed to create log channel");
+
+    config.logChannel = ch.id;
     saveDB();
-    msg.reply("✅ Log channel set");
+
+    msg.reply("✅ Security log channel created & set");
   }
 
   if (msg.content.startsWith("!whitelist add")) {
     const id = msg.mentions.users.first()?.id;
-    if (!id) return msg.reply("Mention user");
+    if (!id) return msg.reply("Mention a user");
 
     config.whitelist.push(id);
     saveDB();
