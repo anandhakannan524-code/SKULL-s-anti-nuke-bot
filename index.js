@@ -17,11 +17,14 @@ const client = new Client({
 });
 
 /* =========================
-   📂 SIMPLE JSON DB
+   📂 DATABASE
 ========================= */
 const DB_FILE = "./data.json";
 let db = {};
-if (fs.existsSync(DB_FILE)) db = JSON.parse(fs.readFileSync(DB_FILE));
+
+if (fs.existsSync(DB_FILE)) {
+  db = JSON.parse(fs.readFileSync(DB_FILE));
+}
 
 function saveDB() {
   fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
@@ -30,7 +33,7 @@ function saveDB() {
 function getConfig(guildId) {
   if (!db[guildId]) {
     db[guildId] = {
-      whitelist: [],
+      whitelist: [], // add bot IDs here if needed
       logChannel: null,
       limits: {
         CHANNEL_DELETE: 3,
@@ -41,12 +44,12 @@ function getConfig(guildId) {
         WEBHOOK: 3
       },
       raid: {
-        JOIN_LIMIT: 3,          // easier to trigger for testing
-        WINDOW_MS: 10000,       // 10s window
+        JOIN_LIMIT: 3,
+        WINDOW_MS: 10000,
         RAID_MODE_MS: 3 * 60 * 1000,
-        NEW_ACCOUNT_MS: 6 * 60 * 60 * 1000, // 6 hours
+        NEW_ACCOUNT_MS: 6 * 60 * 60 * 1000,
         KICK_NEW: true,
-        KICK_BOTS: true,
+        KICK_BOTS: false, // 🔥 IMPORTANT FIX
         LOCKDOWN_ON_RAID: true
       }
     };
@@ -74,11 +77,11 @@ async function log(guild, msg) {
   }
 
   if (ch) ch.send(`📜 ${msg}`).catch(() => {});
-  console.log(`[${guild.name}] ${msg}`);
+  console.log(msg);
 }
 
 /* =========================
-   🔐 SAFETY
+   🔐 SAFE CHECK
 ========================= */
 function isSafe(userId, guild) {
   const cfg = getConfig(guild.id);
@@ -86,43 +89,49 @@ function isSafe(userId, guild) {
 }
 
 /* =========================
-   🔒 LOCKDOWN / UNLOCK
+   🔒 LOCKDOWN
 ========================= */
 async function lockdown(guild) {
-  for (const ch of guild.channels.cache.values()) {
+  guild.channels.cache.forEach(async ch => {
     try {
       await ch.permissionOverwrites.edit(guild.roles.everyone, {
         SendMessages: false
       });
     } catch {}
-  }
+  });
+
   await log(guild, "🔒 Lockdown enabled");
 }
 
 async function unlock(guild) {
-  for (const ch of guild.channels.cache.values()) {
+  guild.channels.cache.forEach(async ch => {
     try {
       await ch.permissionOverwrites.edit(guild.roles.everyone, {
         SendMessages: true
       });
     } catch {}
-  }
+  });
+
   await log(guild, "🔓 Lockdown removed");
 }
 
 /* =========================
-   🚨 ANTI-NUKE (basic)
+   🚨 ANTI-NUKE
 ========================= */
 const tracker = new Map();
 const WINDOW = 5000;
 
 function track(userId, action) {
   const now = Date.now();
+
   if (!tracker.has(userId)) tracker.set(userId, {});
   const data = tracker.get(userId);
+
   if (!data[action]) data[action] = [];
+
   data[action].push(now);
   data[action] = data[action].filter(t => now - t < WINDOW);
+
   return data[action].length;
 }
 
@@ -168,6 +177,7 @@ const raidState = new Map();
 
 function pushJoin(guildId, windowMs) {
   const now = Date.now();
+
   if (!joinTracker.has(guildId)) joinTracker.set(guildId, []);
 
   let arr = joinTracker.get(guildId);
@@ -194,31 +204,29 @@ client.on("guildMemberAdd", async (member) => {
 
   const count = pushJoin(guild.id, R.WINDOW_MS);
 
-  // Bot join
-  if (R.KICK_BOTS && member.user.bot) {
-    await member.kick("Bot raid protection").catch(() => {});
+  // 🤖 BOT CHECK (fixed)
+  if (R.KICK_BOTS && member.user.bot && !isSafe(member.user.id, guild)) {
+    await member.kick("Bot protection").catch(() => {});
     await log(guild, `🤖 Bot kicked: ${member.user.tag}`);
     return;
   }
 
-  // New account
+  // 🆕 NEW ACCOUNT
   const age = Date.now() - member.user.createdTimestamp;
-  if (R.KICK_NEW && age < R.NEW_ACCOUNT_MS) {
+  if (R.KICK_NEW && age < R.NEW_ACCOUNT_MS && !isSafe(member.user.id, guild)) {
     await member.kick("New account").catch(() => {});
     await log(guild, `🚫 New account kicked: ${member.user.tag}`);
     return;
   }
 
-  // Already in raid
   if (isRaidActive(guild.id)) {
     await log(guild, `⚠️ Join during raid: ${member.user.tag}`);
     return;
   }
 
-  // Trigger raid
   if (count >= R.JOIN_LIMIT) {
     startRaid(guild, R.RAID_MODE_MS);
-    await log(guild, `🚨 RAID DETECTED (${count} joins)`);
+    await log(guild, "🚨 RAID DETECTED");
 
     if (R.LOCKDOWN_ON_RAID) {
       await lockdown(guild);
@@ -227,7 +235,7 @@ client.on("guildMemberAdd", async (member) => {
 });
 
 /* =========================
-   💬 COMMANDS (ADMIN)
+   💬 COMMANDS
 ========================= */
 client.on('messageCreate', async (msg) => {
   if (!msg.guild) return;
@@ -237,14 +245,29 @@ client.on('messageCreate', async (msg) => {
 
   if (msg.content === "!setup") {
     let ch = msg.guild.channels.cache.find(c => c.name === "security-logs");
+
     if (!ch) {
       ch = await msg.guild.channels.create({ name: "security-logs" }).catch(() => null);
     }
+
     if (!ch) return msg.reply("❌ Failed");
 
     cfg.logChannel = ch.id;
     saveDB();
+
     msg.reply("✅ Logs ready");
+  }
+
+  if (msg.content.startsWith("!whitelist add")) {
+    const id = msg.mentions.users.first()?.id;
+    if (!id) return msg.reply("Mention user");
+
+    if (!cfg.whitelist.includes(id)) {
+      cfg.whitelist.push(id);
+      saveDB();
+    }
+
+    msg.reply("✅ Added to whitelist");
   }
 
   if (msg.content === "!lockdown") {
